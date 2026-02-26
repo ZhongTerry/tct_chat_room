@@ -23,7 +23,7 @@ online_users = {}
 
 # ── Upload config ───────────────────────────────────────────────────────────
 UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'uploads')
-ALLOWED_IMAGE  = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'tiff', 'ico', 'avif'}
+ALLOWED_IMAGE  = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'ico', 'avif'}
 ALLOWED_AUDIO  = {'webm', 'ogg', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'opus'}
 ALLOWED_VIDEO  = {'mp4', 'mkv', 'mov', 'avi', 'webm', 'flv', 'm4v'}
 MAX_UPLOAD_MB  = 100   # single-file limit raised; quota enforced per-user
@@ -196,6 +196,12 @@ def update_profile():
     bio          = data.get('bio')
     theme        = data.get('theme')
     font_size    = data.get('font_size')
+    # Validate avatar_url: only allow clearing or server-uploaded paths
+    if avatar_url is not None and avatar_url != '' and avatar_url is not None:
+        if not avatar_url.startswith('/static/uploads/avatars/') or '..' in avatar_url:
+            return jsonify({'ok': False, 'msg': '无效的头像地址'})
+        if not db.verify_file_owner(session['user_id'], avatar_url):
+            return jsonify({'ok': False, 'msg': '无效的头像地址'})
     if theme and theme not in ('light', 'dark'):
         return jsonify({'ok': False, 'msg': '无效的主题'})
     if font_size and font_size not in ('small', 'medium', 'large'):
@@ -215,6 +221,8 @@ def _allowed_ext(filename, allowed_set):
 
 def _save_upload(file_storage, sub_dir):
     """Save an uploaded file and return its public URL."""
+    if '..' in sub_dir or '/' in sub_dir or '\\' in sub_dir:
+        raise ValueError('Invalid sub_dir')
     folder = os.path.join(UPLOAD_FOLDER, sub_dir)
     os.makedirs(folder, exist_ok=True)
     ext = file_storage.filename.rsplit('.', 1)[-1].lower() if '.' in file_storage.filename else 'bin'
@@ -238,6 +246,13 @@ def upload_avatar():
     if size_mb > 5:
         return jsonify({'ok': False, 'msg': '头像图片不超过 5 MB'})
     url = _save_upload(f, 'avatars')
+    file_size = f.seek(0, 2)
+    f.seek(0)
+    if not db.record_file_upload(session['user_id'], url, file_size if file_size else 0):
+        saved_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), url.lstrip('/'))
+        if os.path.exists(saved_path):
+            os.remove(saved_path)
+        return jsonify({'ok': False, 'msg': '云盘空间不足'})
     db.update_profile(session['user_id'], avatar_url=url)
     return jsonify({'ok': True, 'url': url})
 
@@ -483,11 +498,24 @@ def on_send(data):
     uid = session.get('user_id')
     if not uid:
         return
+    if db.is_user_banned(uid):
+        return
     conv_id  = data.get('conversation_id')
     content  = data.get('content', '').strip()
-    msg_type = data.get('msg_type', 'text')   # 'text'|'image'|'audio'|'file'
-    media_url = data.get('media_url')         # server-side path already saved by /api/upload
+    msg_type = data.get('msg_type', 'text')
+    media_url = data.get('media_url')
     filename  = data.get('filename', '')
+
+    # Whitelist msg_type
+    if msg_type not in ('text', 'image', 'audio', 'video', 'file'):
+        msg_type = 'text'
+
+    # Validate media_url: must be a local upload path owned by this user
+    if media_url:
+        if not isinstance(media_url, str) or not media_url.startswith('/static/uploads/') or '..' in media_url:
+            return
+        if not db.verify_file_owner(uid, media_url):
+            return
 
     # For media messages content may be empty – use filename as fallback display text
     if msg_type != 'text' and not content:
