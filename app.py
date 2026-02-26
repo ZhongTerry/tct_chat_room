@@ -33,6 +33,12 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 @app.before_request
 def before_req():
     db.init_db()
+    # Reject banned users on every request
+    if 'user_id' in session and request.path.startswith('/api/') and request.path != '/api/logout':
+        user = db.get_user_by_id(session['user_id'])
+        if not user or db.is_user_banned(session['user_id']):
+            session.clear()
+            return jsonify({'ok': False, 'msg': '账号已被封禁或已删除'}), 403
 
 
 # ---------- Pages ----------
@@ -272,12 +278,6 @@ def upload_file():
     if size_mb > MAX_UPLOAD_MB:
         return jsonify({'ok': False, 'msg': f'单文件不超过 {MAX_UPLOAD_MB} MB'})
 
-    # ── Quota check ─────────────────────────────────────────────
-    storage = db.get_user_storage_info(session['user_id'])
-    if storage['used_bytes'] + file_size > storage['quota_bytes']:
-        avail_mb = round((storage['quota_bytes'] - storage['used_bytes']) / (1024 * 1024), 1)
-        return jsonify({'ok': False, 'msg': f'云盘空间不足，可用剩余 {avail_mb} MB'})
-
     ext = f.filename.rsplit('.', 1)[-1].lower() if '.' in f.filename else ''
     if ext in ALLOWED_IMAGE:
         msg_type, sub = 'image', 'images'
@@ -286,10 +286,16 @@ def upload_file():
     elif ext in ALLOWED_VIDEO:
         msg_type, sub = 'video', 'video'
     else:
-        msg_type, sub = 'file', 'files'   # allow ALL other types as generic file
+        msg_type, sub = 'file', 'files'
 
     url = _save_upload(f, sub)
-    db.record_file_upload(session['user_id'], url, file_size)
+    # Atomic quota check + record
+    if not db.record_file_upload(session['user_id'], url, file_size):
+        # Quota exceeded — remove the saved file
+        saved_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), url.lstrip('/'))
+        if os.path.exists(saved_path):
+            os.remove(saved_path)
+        return jsonify({'ok': False, 'msg': '云盘空间不足'})
     return jsonify({'ok': True, 'url': url, 'msg_type': msg_type,
                     'filename': secure_filename(f.filename) or f'file.{ext}'})
 
@@ -502,8 +508,8 @@ def on_send(data):
         return
     conv_id  = data.get('conversation_id')
     content  = data.get('content', '').strip()
-    msg_type = data.get('msg_type', 'text')
-    media_url = data.get('media_url')
+    msg_type = data.get('msg_type', 'text')   # 'text'|'image'|'audio'|'file'
+    media_url = data.get('media_url')         # server-side path already saved by /api/upload
     filename  = data.get('filename', '')
 
     # Whitelist msg_type
