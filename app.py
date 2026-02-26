@@ -3,21 +3,31 @@ from flask_socketio import SocketIO, emit, join_room
 import database as db
 import os
 import json
+import uuid
+from werkzeug.utils import secure_filename
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24).hex())
 
-DEBUG = False # get debug mode
+DEBUG = False  # set True for development
 
 if DEBUG:
-    socketio = SocketIO(app, cors_allowed_origins="*")
+    socketio = SocketIO(app, cors_allowed_origins='*')
 else:
-    socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent')
+    socketio = SocketIO(app, cors_allowed_origins='*', async_mode='gevent')
 
 # user_id -> set of sid
 online_users = {}
+
+# ── Upload config ───────────────────────────────────────────────────────────
+UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'uploads')
+ALLOWED_IMAGE  = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'tiff', 'ico', 'avif'}
+ALLOWED_AUDIO  = {'webm', 'ogg', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'opus'}
+ALLOWED_VIDEO  = {'mp4', 'mkv', 'mov', 'avi', 'webm', 'flv', 'm4v'}
+MAX_UPLOAD_MB  = 100   # single-file limit raised; quota enforced per-user
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 @app.before_request
@@ -116,6 +126,14 @@ def create_private():
     return jsonify({'ok': True, 'conversation_id': conv_id})
 
 
+@app.route('/api/conversations/self', methods=['POST'])
+def create_self_chat():
+    if 'user_id' not in session:
+        return jsonify({'ok': False}), 401
+    conv_id = db.create_self_conversation(session['user_id'])
+    return jsonify({'ok': True, 'conversation_id': conv_id})
+
+
 @app.route('/api/conversations/group', methods=['POST'])
 def create_group():
     if 'user_id' not in session:
@@ -174,18 +192,91 @@ def update_profile():
         return jsonify({'ok': False}), 401
     data = request.json or {}
     avatar_emoji = data.get('avatar_emoji')
-    bio = data.get('bio')
-    theme = data.get('theme')
-    font_size = data.get('font_size')
+    avatar_url   = data.get('avatar_url')    # set to '' to clear custom avatar
+    bio          = data.get('bio')
+    theme        = data.get('theme')
+    font_size    = data.get('font_size')
     if theme and theme not in ('light', 'dark'):
         return jsonify({'ok': False, 'msg': '无效的主题'})
     if font_size and font_size not in ('small', 'medium', 'large'):
         return jsonify({'ok': False, 'msg': '无效的字体大小'})
     if bio is not None and len(bio) > 100:
         return jsonify({'ok': False, 'msg': '个性签名最多100个字符'})
-    db.update_profile(session['user_id'], avatar_emoji=avatar_emoji, bio=bio,
-                      theme=theme, font_size=font_size)
+    db.update_profile(session['user_id'], avatar_emoji=avatar_emoji, avatar_url=avatar_url,
+                      bio=bio, theme=theme, font_size=font_size)
     return jsonify({'ok': True, 'msg': '设置已保存'})
+
+
+# ── File / Avatar upload ────────────────────────────────────────────────────
+
+def _allowed_ext(filename, allowed_set):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_set
+
+
+def _save_upload(file_storage, sub_dir):
+    """Save an uploaded file and return its public URL."""
+    folder = os.path.join(UPLOAD_FOLDER, sub_dir)
+    os.makedirs(folder, exist_ok=True)
+    ext = file_storage.filename.rsplit('.', 1)[-1].lower() if '.' in file_storage.filename else 'bin'
+    filename = f'{uuid.uuid4().hex}.{ext}'
+    file_storage.save(os.path.join(folder, filename))
+    return f'/static/uploads/{sub_dir}/{filename}'
+
+
+@app.route('/api/upload/avatar', methods=['POST'])
+def upload_avatar():
+    if 'user_id' not in session:
+        return jsonify({'ok': False}), 401
+    f = request.files.get('file')
+    if not f:
+        return jsonify({'ok': False, 'msg': '未选择文件'})
+    if not _allowed_ext(f.filename, ALLOWED_IMAGE):
+        return jsonify({'ok': False, 'msg': '仅支持图片格式'})
+    f.seek(0, 2)
+    size_mb = f.tell() / (1024 * 1024)
+    f.seek(0)
+    if size_mb > 5:
+        return jsonify({'ok': False, 'msg': '头像图片不超过 5 MB'})
+    url = _save_upload(f, 'avatars')
+    db.update_profile(session['user_id'], avatar_url=url)
+    return jsonify({'ok': True, 'url': url})
+
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    """Upload media/file for chat messages. Enforces per-user storage quota."""
+    if 'user_id' not in session:
+        return jsonify({'ok': False}), 401
+    f = request.files.get('file')
+    if not f:
+        return jsonify({'ok': False, 'msg': '未选择文件'})
+    f.seek(0, 2)
+    file_size = f.tell()
+    f.seek(0)
+    size_mb = file_size / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        return jsonify({'ok': False, 'msg': f'单文件不超过 {MAX_UPLOAD_MB} MB'})
+
+    # ── Quota check ─────────────────────────────────────────────
+    storage = db.get_user_storage_info(session['user_id'])
+    if storage['used_bytes'] + file_size > storage['quota_bytes']:
+        avail_mb = round((storage['quota_bytes'] - storage['used_bytes']) / (1024 * 1024), 1)
+        return jsonify({'ok': False, 'msg': f'云盘空间不足，可用剩余 {avail_mb} MB'})
+
+    ext = f.filename.rsplit('.', 1)[-1].lower() if '.' in f.filename else ''
+    if ext in ALLOWED_IMAGE:
+        msg_type, sub = 'image', 'images'
+    elif ext in ALLOWED_AUDIO:
+        msg_type, sub = 'audio', 'audio'
+    elif ext in ALLOWED_VIDEO:
+        msg_type, sub = 'video', 'video'
+    else:
+        msg_type, sub = 'file', 'files'   # allow ALL other types as generic file
+
+    url = _save_upload(f, sub)
+    db.record_file_upload(session['user_id'], url, file_size)
+    return jsonify({'ok': True, 'url': url, 'msg_type': msg_type,
+                    'filename': secure_filename(f.filename) or f'file.{ext}'})
 
 
 @app.route('/api/settings/password', methods=['POST'])
@@ -203,6 +294,15 @@ def change_password():
     if ok:
         session.clear()
     return jsonify({'ok': ok, 'msg': msg})
+
+
+@app.route('/api/storage/usage')
+def storage_usage():
+    """Return the current user's cloud storage usage and quota."""
+    if 'user_id' not in session:
+        return jsonify({'ok': False}), 401
+    info = db.get_user_storage_info(session['user_id'])
+    return jsonify({'ok': True, **info})
 
 
 # ---------- Contacts / Friends API ----------
@@ -383,19 +483,28 @@ def on_send(data):
     uid = session.get('user_id')
     if not uid:
         return
-    conv_id = data.get('conversation_id')
-    content = data.get('content', '').strip()
-    if not conv_id or not content:
+    conv_id  = data.get('conversation_id')
+    content  = data.get('content', '').strip()
+    msg_type = data.get('msg_type', 'text')   # 'text'|'image'|'audio'|'file'
+    media_url = data.get('media_url')         # server-side path already saved by /api/upload
+    filename  = data.get('filename', '')
+
+    # For media messages content may be empty – use filename as fallback display text
+    if msg_type != 'text' and not content:
+        content = filename or msg_type
+    if not conv_id or (not content and msg_type == 'text'):
         return
     if not db.is_member(conv_id, uid):
         return
-    # Enforce max message length from system settings
-    settings = db.get_system_settings()
-    max_len = int(settings.get('max_message_length', '2000'))
-    if len(content) > max_len:
-        return
-    msg = db.save_message(conv_id, uid, content)
+    if msg_type == 'text':
+        settings = db.get_system_settings()
+        max_len = int(settings.get('max_message_length', '2000'))
+        if len(content) > max_len:
+            return
+    msg = db.save_message(conv_id, uid, content, msg_type=msg_type, media_url=media_url)
     msg['sender_name'] = session.get('username')
+    if filename:
+        msg['filename'] = filename
     emit('new_message', msg, room=f'conv_{conv_id}')
 
 
@@ -457,7 +566,48 @@ def admin_logout():
 @require_admin
 def admin_get_users():
     users = db.get_all_users()
+    # Attach global quota to users who haven't overridden it
+    settings = db.get_system_settings()
+    default_quota_mb = int(settings.get('default_storage_quota_mb', '10240'))
+    for u in users:
+        if u['storage_quota_mb'] is None:
+            u['storage_quota_mb'] = default_quota_mb
+            u['quota_is_default'] = True
+        else:
+            u['quota_is_default'] = False
     return jsonify({'ok': True, 'users': users})
+
+
+@app.route('/api/admin/users', methods=['POST'])
+@require_admin
+def admin_create_user():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    if not username or not password:
+        return jsonify({'ok': False, 'msg': '用户名和密码不能为空'})
+    if len(username) < 2 or len(username) > 20:
+        return jsonify({'ok': False, 'msg': '用户名长度应2-20个字符'})
+    if len(password) < 4:
+        return jsonify({'ok': False, 'msg': '密码至少4个字符'})
+    ok, msg = db.create_user(username, password)
+    return jsonify({'ok': ok, 'msg': msg})
+
+
+@app.route('/api/admin/users/<int:user_id>/quota', methods=['PUT'])
+@require_admin
+def admin_set_user_quota(user_id):
+    data = request.json or {}
+    quota_mb = data.get('quota_mb')
+    if quota_mb is not None:
+        try:
+            quota_mb = int(quota_mb)
+            if quota_mb < 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            return jsonify({'ok': False, 'msg': '无效的配额值'})
+    db.set_user_quota(user_id, quota_mb)
+    return jsonify({'ok': True, 'msg': '用户配额已更新'})
 
 
 @app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
@@ -525,7 +675,7 @@ def admin_get_system_settings():
 def admin_update_system_settings():
     data = request.json or {}
     allowed_keys = ('registration_enabled', 'max_message_length', 'system_name',
-                    'allow_friend_requests')
+                    'allow_friend_requests', 'default_storage_quota_mb')
     for key in allowed_keys:
         if key in data:
             db.update_system_setting(key, str(data[key]))

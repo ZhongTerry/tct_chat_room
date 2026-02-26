@@ -8,11 +8,27 @@ let selectedGroupMembers = [];
 let socket = null;
 let userProfile = null;
 let selectedAvatarEmoji = '😊';
+let selectedAvatarUrl = null;   // custom image avatar URL
 let currentTheme = 'light';
 let currentFontSize = 'medium';
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let speechRec = null;
+let isSpeaking = false;
 
 const AVATAR_EMOJIS = ['😊','😎','🤩','🥳','😄','🦊','🐼','🐨','🦁','🐯',
                        '🦄','🐸','🦋','⭐','🌸','🎯','🚀','💎','🎸','🏆'];
+
+// ===== Helpers =====
+function setAvatarEl(el, avatarUrl, avatarEmoji, username) {
+    if (avatarUrl) {
+        el.innerHTML = `<img src="${avatarUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+        el.title = username || '';
+    } else {
+        el.textContent = avatarEmoji || (username ? username[0].toUpperCase() : '?');
+    }
+}
 
 // ===== Init =====
 document.addEventListener('DOMContentLoaded', async () => {
@@ -26,12 +42,28 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('myAvatar').textContent = currentUser.username[0].toUpperCase();
     document.getElementById('myName').textContent = currentUser.username;
 
-    // Load profile and apply theme/font
     await loadProfile();
-
     await loadConversations();
     await loadContacts();
     initSocket();
+
+    // ── Drag-drop for file upload ────────────────────────────────────────
+    const app = document.querySelector('.app');
+    app.addEventListener('dragover', e => {
+        e.preventDefault();
+        if (currentConvId) document.getElementById('dropOverlay').style.display = 'flex';
+    });
+    app.addEventListener('dragleave', e => {
+        if (!e.relatedTarget || !app.contains(e.relatedTarget))
+            document.getElementById('dropOverlay').style.display = 'none';
+    });
+    app.addEventListener('drop', e => {
+        e.preventDefault();
+        document.getElementById('dropOverlay').style.display = 'none';
+        if (!currentConvId) return;
+        const files = e.dataTransfer.files;
+        if (files.length) [...files].forEach(uploadAndSendFile);
+    });
 });
 
 // ===== Profile =====
@@ -41,10 +73,12 @@ async function loadProfile() {
     if (!data.ok) return;
     userProfile = data.profile;
     selectedAvatarEmoji = userProfile.avatar_emoji || '😊';
+    selectedAvatarUrl = userProfile.avatar_url || null;
     currentTheme = userProfile.theme || 'light';
     currentFontSize = userProfile.font_size || 'medium';
     // Apply avatar
-    document.getElementById('myAvatar').textContent = selectedAvatarEmoji;
+    const myAvatarEl = document.getElementById('myAvatar');
+    setAvatarEl(myAvatarEl, selectedAvatarUrl, selectedAvatarEmoji, currentUser?.username);
     applyTheme(currentTheme);
     applyFontSize(currentFontSize);
 }
@@ -136,15 +170,19 @@ function renderConversations() {
     list.innerHTML = conversations.map(c => {
         const isActive = c.id === currentConvId;
         const isGroup = c.is_group;
+        const isSelf = c.is_self_chat;
         const initial = c.display_name[0].toUpperCase();
-        const lastText = c.last_message
-            ? (isGroup ? `${c.last_message.sender_name}: ` : '') + c.last_message.content
+        const icon = isSelf ? '📝' : (isGroup ? '👥' : initial);
+        const lastMsg = c.last_message;
+        const lastText = lastMsg
+            ? (isGroup && !isSelf ? `${lastMsg.sender_name}: ` : '') +
+              (lastMsg.msg_type && lastMsg.msg_type !== 'text' ? `[${{'image':'图片','audio':'语音','file':'文件'}[lastMsg.msg_type] || '附件'}]` : lastMsg.content)
             : '暂无消息';
-        const lastTime = c.last_message ? formatTime(c.last_message.timestamp) : '';
+        const lastTime = lastMsg ? formatTime(lastMsg.timestamp) : '';
         return `
             <div class="conv-item ${isActive ? 'active' : ''} ${isGroup ? 'group' : ''}"
                  onclick="openConversation(${c.id})">
-                <div class="conv-avatar">${isGroup ? '👥' : initial}</div>
+                <div class="conv-avatar">${icon}</div>
                 <div class="conv-info">
                     <div class="conv-name">${escapeHtml(c.display_name)}</div>
                     <div class="conv-last">${escapeHtml(lastText)}</div>
@@ -246,9 +284,24 @@ function createMessageElement(msg, animate = true) {
     const senderHtml = !isMine ? `<div class="msg-sender">${escapeHtml(msg.sender_name)}</div>` : '';
     const timeStr = new Date(msg.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+    let bubbleContent;
+    const msgType = msg.msg_type || 'text';
+    if (msgType === 'image' && msg.media_url) {
+        bubbleContent = `<img src="${escapeHtml(msg.media_url)}" class="msg-image" alt="图片"
+            onclick="window.open('${escapeHtml(msg.media_url)}','_blank')">`;
+    } else if (msgType === 'audio' && msg.media_url) {
+        bubbleContent = `<audio controls src="${escapeHtml(msg.media_url)}" class="msg-audio"></audio>`;
+    } else if (msgType === 'video' && msg.media_url) {
+        bubbleContent = `<video controls src="${escapeHtml(msg.media_url)}" class="msg-image" style="max-height:200px"></video>`;
+    } else if (msgType === 'file' && msg.media_url) {
+        bubbleContent = `<a href="${escapeHtml(msg.media_url)}" download class="msg-file">📎 ${escapeHtml(msg.content)}</a>`;
+    } else {
+        bubbleContent = escapeHtml(msg.content);
+    }
+
     row.innerHTML = `
         ${senderHtml}
-        <div class="msg-bubble">${escapeHtml(msg.content)}</div>
+        <div class="msg-bubble">${bubbleContent}</div>
         <div class="msg-time">${timeStr}</div>
     `;
     return row;
@@ -757,13 +810,16 @@ function openSettings(tab) {
     const modal = document.getElementById('settingsModal');
     modal.classList.add('show');
     // Populate settings
-    document.getElementById('settingsAvatar').textContent = selectedAvatarEmoji;
+    const settingsAvatarEl = document.getElementById('settingsAvatar');
+    setAvatarEl(settingsAvatarEl, selectedAvatarUrl, selectedAvatarEmoji, currentUser?.username);
+    const previewAvatarEl = document.getElementById('previewAvatar');
+    if (previewAvatarEl) setAvatarEl(previewAvatarEl, selectedAvatarUrl, selectedAvatarEmoji, currentUser?.username);
     document.getElementById('settingsUsername').textContent = currentUser.username;
 
     // Populate avatar picker
     const picker = document.getElementById('avatarPicker');
     picker.innerHTML = AVATAR_EMOJIS.map(e => `
-        <div class="avatar-option ${e === selectedAvatarEmoji ? 'selected' : ''}"
+        <div class="avatar-option ${e === selectedAvatarEmoji && !selectedAvatarUrl ? 'selected' : ''}"
              onclick="selectAvatar('${e}', this)">${e}</div>
     `).join('');
 
@@ -790,19 +846,48 @@ function closeSettingsIfOverlay(e) {
 }
 
 function switchSettingsTab(tab) {
-    ['profile', 'security', 'appearance', 'notification'].forEach(t => {
+    ['profile', 'security', 'appearance', 'notification', 'storage'].forEach(t => {
         document.getElementById(`stab-${t}`).style.display = t === tab ? 'block' : 'none';
         const navItem = document.getElementById(`snav-${t}`);
         if (navItem) navItem.classList.toggle('active', t === tab);
     });
+    if (tab === 'storage') loadStorageInfo();
+}
+
+async function loadStorageInfo() {
+    const res = await fetch('/api/storage/usage');
+    const data = await res.json();
+    if (!data.ok) return;
+    const usedMb = data.used_mb;
+    const quotaMb = data.quota_mb;
+    const percent = Math.min(data.percent, 100);
+
+    const fmt = mb => mb >= 1024
+        ? `${(mb / 1024).toFixed(2)} GB`
+        : `${mb.toFixed(1)} MB`;
+
+    document.getElementById('storageText').textContent =
+        `${fmt(usedMb)} / ${fmt(quotaMb)}  (${data.percent.toFixed(1)}%)`;
+    document.getElementById('storageUsed').textContent = `已用 ${fmt(usedMb)}`;
+    document.getElementById('storageQuota').textContent = `总配额 ${fmt(quotaMb)}`;
+    document.getElementById('quotaMbLabel').textContent = (quotaMb / 1024).toFixed(1);
+
+    const bar = document.getElementById('storageBar');
+    bar.style.width = `${percent}%`;
+    bar.style.background = percent > 90 ? '#EF4444'
+        : percent > 70 ? '#F59E0B'
+        : 'var(--primary)';
 }
 
 function selectAvatar(emoji, el) {
     selectedAvatarEmoji = emoji;
+    selectedAvatarUrl = null;   // clear custom image when emoji selected
     document.querySelectorAll('.avatar-option').forEach(e => e.classList.remove('selected'));
     el.classList.add('selected');
-    document.getElementById('myAvatar').textContent = emoji;
-    document.getElementById('settingsAvatar').textContent = emoji;
+    setAvatarEl(document.getElementById('myAvatar'), null, emoji, currentUser?.username);
+    setAvatarEl(document.getElementById('settingsAvatar'), null, emoji, currentUser?.username);
+    const previewAvatarEl = document.getElementById('previewAvatar');
+    if (previewAvatarEl) setAvatarEl(previewAvatarEl, null, emoji, currentUser?.username);
 }
 
 async function saveProfile() {
@@ -810,15 +895,171 @@ async function saveProfile() {
     const res = await fetch('/api/profile', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ avatar_emoji: selectedAvatarEmoji, bio })
+        body: JSON.stringify({ avatar_emoji: selectedAvatarEmoji, avatar_url: selectedAvatarUrl, bio })
     });
     const data = await res.json();
     if (data.ok) {
-        if (userProfile) { userProfile.bio = bio; userProfile.avatar_emoji = selectedAvatarEmoji; }
+        if (userProfile) {
+            userProfile.bio = bio;
+            userProfile.avatar_emoji = selectedAvatarEmoji;
+            userProfile.avatar_url = selectedAvatarUrl;
+        }
         showSimpleToast('个人资料已保存', 'success');
     } else {
         showSimpleToast(data.msg, 'error');
     }
+}
+
+// ── Avatar upload / clear ────────────────────────────────────────────────────
+async function uploadAvatar(input) {
+    if (!input.files.length) return;
+    const file = input.files[0];
+    const formData = new FormData();
+    formData.append('file', file);
+    showSimpleToast('上传中...', 'info');
+    const res = await fetch('/api/upload/avatar', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (!data.ok) { showSimpleToast(data.msg || '上传失败', 'error'); return; }
+    selectedAvatarUrl = data.url;
+    setAvatarEl(document.getElementById('myAvatar'), selectedAvatarUrl, selectedAvatarEmoji, currentUser?.username);
+    setAvatarEl(document.getElementById('settingsAvatar'), selectedAvatarUrl, selectedAvatarEmoji, currentUser?.username);
+    const previewAvatarEl = document.getElementById('previewAvatar');
+    if (previewAvatarEl) setAvatarEl(previewAvatarEl, selectedAvatarUrl, selectedAvatarEmoji, currentUser?.username);
+    // Persist immediately
+    await fetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ avatar_url: selectedAvatarUrl })
+    });
+    if (userProfile) userProfile.avatar_url = selectedAvatarUrl;
+    showSimpleToast('头像已更新', 'success');
+    input.value = '';
+}
+
+async function clearAvatarUrl() {
+    selectedAvatarUrl = null;
+    setAvatarEl(document.getElementById('myAvatar'), null, selectedAvatarEmoji, currentUser?.username);
+    setAvatarEl(document.getElementById('settingsAvatar'), null, selectedAvatarEmoji, currentUser?.username);
+    const previewAvatarEl = document.getElementById('previewAvatar');
+    if (previewAvatarEl) setAvatarEl(previewAvatarEl, null, selectedAvatarEmoji, currentUser?.username);
+    await fetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ avatar_url: null })
+    });
+    if (userProfile) userProfile.avatar_url = null;
+    showSimpleToast('已清除图片头像', 'success');
+}
+
+// ── Self-chat (备忘录) ────────────────────────────────────────────────────────
+async function openSelfChat() {
+    const res = await fetch('/api/conversations/self', { method: 'POST' });
+    const data = await res.json();
+    if (!data.ok) { showSimpleToast(data.msg || '创建失败', 'error'); return; }
+    await loadConversations();
+    await openConversation(data.conversation_id);
+    closeNewChatModal && closeNewChatModal();
+}
+
+// ── File upload helpers ──────────────────────────────────────────────────────
+async function handleFileSelect(input) {
+    if (!input.files.length) return;
+    await uploadAndSendFile(input.files[0]);
+    input.value = '';
+}
+
+async function uploadAndSendFile(file) {
+    if (!currentConvId) return;
+    const formData = new FormData();
+    formData.append('file', file);
+    showSimpleToast('上传中...', 'info');
+    const res = await fetch('/api/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (!data.ok) { showSimpleToast(data.msg || '上传失败', 'error'); return; }
+    socket.emit('send_message', {
+        conversation_id: currentConvId,
+        content: data.filename || file.name,
+        msg_type: data.msg_type,
+        media_url: data.url
+    });
+}
+
+// ── Voice recording ──────────────────────────────────────────────────────────
+async function toggleRecording() {
+    const btn = document.getElementById('recordBtn');
+    if (isRecording) {
+        // Stop recording
+        mediaRecorder.stop();
+        isRecording = false;
+        btn.classList.remove('recording');
+        btn.title = '录音';
+        return;
+    }
+    if (!navigator.mediaDevices) { showSimpleToast('浏览器不支持录音', 'error'); return; }
+    if (!currentConvId) { showSimpleToast('请先选择会话', 'error'); return; }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = e => { if (e.data.size) audioChunks.push(e.data); };
+        mediaRecorder.onstop = async () => {
+            stream.getTracks().forEach(t => t.stop());
+            const blob = new Blob(audioChunks, { type: 'audio/webm' });
+            const formData = new FormData();
+            formData.append('file', blob, `recording_${Date.now()}.webm`);
+            showSimpleToast('上传录音...', 'info');
+            const res = await fetch('/api/upload', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (!data.ok) { showSimpleToast(data.msg || '上传失败', 'error'); return; }
+            socket.emit('send_message', {
+                conversation_id: currentConvId,
+                content: '语音消息',
+                msg_type: 'audio',
+                media_url: data.url
+            });
+        };
+        mediaRecorder.start();
+        isRecording = true;
+        btn.classList.add('recording');
+        btn.title = '点击停止录音';
+    } catch (err) {
+        showSimpleToast('无法访问麦克风: ' + err.message, 'error');
+    }
+}
+
+// ── Speech recognition ───────────────────────────────────────────────────────
+function toggleSpeech() {
+    const btn = document.getElementById('speechBtn');
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) { showSimpleToast('浏览器不支持语音识别', 'error'); return; }
+    if (isSpeaking) {
+        speechRec && speechRec.stop();
+        isSpeaking = false;
+        btn.classList.remove('recording');
+        btn.title = '语音输入';
+        return;
+    }
+    speechRec = new SpeechRecognition();
+    speechRec.lang = 'zh-CN';
+    speechRec.continuous = false;
+    speechRec.interimResults = false;
+    speechRec.onresult = e => {
+        const text = e.results[0][0].transcript;
+        const input = document.getElementById('msgInput');
+        input.value += text;
+        input.style.height = 'auto';
+        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    };
+    speechRec.onerror = e => { showSimpleToast('识别错误: ' + e.error, 'error'); };
+    speechRec.onend = () => {
+        isSpeaking = false;
+        btn.classList.remove('recording');
+        btn.title = '语音输入';
+    };
+    speechRec.start();
+    isSpeaking = true;
+    btn.classList.add('recording');
+    btn.title = '点击停止识别';
 }
 
 async function savePassword() {

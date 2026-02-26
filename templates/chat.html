@@ -11,6 +11,13 @@
     <div id="toastContainer"></div>
 
     <div class="app">
+        <!-- Drag-drop overlay -->
+        <div id="dropOverlay" class="drop-overlay" style="display:none">
+            <div class="drop-content">
+                <div style="font-size:48px">📎</div>
+                <div style="font-size:18px;margin-top:8px">松开以发送文件</div>
+            </div>
+        </div>
         <!-- Sidebar -->
         <aside class="sidebar">
             <div class="sidebar-header">
@@ -35,8 +42,9 @@
             </div>
 
             <!-- Chats Panel -->
-            <div id="panel-chats">
+            <div id="panel-chats" style="flex:1; display:flex; flex-direction:column; overflow:hidden; min-height:0;">
                 <div class="sidebar-actions">
+                    <button class="action-btn" onclick="openSelfChat()" title="我的备忘录">📝 备忘录</button>
                     <button class="action-btn" onclick="showModal('newChat')">新对话</button>
                     <button class="action-btn" onclick="showModal('newGroup')">创建群聊</button>
                 </div>
@@ -86,7 +94,15 @@
                     <button class="load-more" id="loadMoreBtn" onclick="loadMore()" style="display:none">加载更多</button>
                 </div>
                 <div class="input-area">
-                    <textarea id="msgInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
+                    <div class="input-toolbar">
+                        <button class="toolbar-btn" title="发送图片/文件" onclick="document.getElementById('fileInput').click()">📎</button>
+                        <input type="file" id="fileInput" style="display:none"
+                               accept="image/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.zip,.rar,.7z,.md"
+                               onchange="handleFileSelect(this)">
+                        <button class="toolbar-btn" id="recordBtn" title="录音" onclick="toggleRecording()">🎤</button>
+                        <button class="toolbar-btn" id="speechBtn" title="语音识别" onclick="toggleSpeech()">🗣️</button>
+                    </div>
+                    <textarea id="msgInput" placeholder="输入消息… (Enter 发送, Shift+Enter 换行)"
                               onkeydown="handleKey(event)"></textarea>
                     <button class="send-btn" onclick="sendMessage()">发送</button>
                 </div>
@@ -148,6 +164,7 @@
                 <button class="settings-nav-item" id="snav-security" onclick="switchSettingsTab('security')">🔒 账号安全</button>
                 <button class="settings-nav-item" id="snav-appearance" onclick="switchSettingsTab('appearance')">🎨 个性化</button>
                 <button class="settings-nav-item" id="snav-notification" onclick="switchSettingsTab('notification')">🔔 通知设置</button>
+                <button class="settings-nav-item" id="snav-storage" onclick="switchSettingsTab('storage')">☁️ 云存储</button>
             </div>
             <div class="settings-content">
                 <button class="icon-btn" style="position:absolute;top:14px;right:14px" onclick="closeSettings()">✕</button>
@@ -157,6 +174,20 @@
                     <h2 class="settings-title">个人资料</h2>
                     <div class="settings-group">
                         <label class="settings-label">头像</label>
+                        <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+                            <span class="avatar" id="previewAvatar" style="width:52px;height:52px;font-size:22px;overflow:hidden;border-radius:50%"></span>
+                            <div>
+                                <div style="font-size:12px;color:var(--text-3);margin-bottom:6px">上传自定义头像（最大5MB）</div>
+                                <label class="avatar-upload-btn">
+                                    📷 选择图片
+                                    <input type="file" id="avatarFileInput" accept="image/*"
+                                           style="display:none" onchange="uploadAvatar(this)">
+                                </label>
+                                <button class="avatar-upload-btn danger" onclick="clearAvatarUrl()" style="margin-left:6px">
+                                    清除图片头像
+                                </button>
+                            </div>
+                        </div>
                         <div class="avatar-picker" id="avatarPicker"></div>
                     </div>
                     <div class="settings-group">
@@ -239,6 +270,33 @@
                             </label>
                         </div>
                     </div>
+                </div>
+
+                <!-- Storage Tab -->
+                <div class="settings-tab" id="stab-storage" style="display:none">
+                    <h2 class="settings-title">云存储</h2>
+                    <div class="settings-group">
+                        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+                            <label class="settings-label" style="margin-bottom:0">存储用量</label>
+                            <span id="storageText" style="font-size:12px;color:var(--text-3)">加载中...</span>
+                        </div>
+                        <div style="height:10px;background:var(--bg);border-radius:5px;overflow:hidden;border:1px solid var(--border)">
+                            <div id="storageBar" style="height:100%;width:0%;background:var(--primary);border-radius:5px;transition:width 0.4s"></div>
+                        </div>
+                        <div style="display:flex;justify-content:space-between;margin-top:5px">
+                            <span id="storageUsed" style="font-size:11px;color:var(--text-3)"></span>
+                            <span id="storageQuota" style="font-size:11px;color:var(--text-3)"></span>
+                        </div>
+                    </div>
+                    <div class="settings-group">
+                        <label class="settings-label">上传说明</label>
+                        <p style="font-size:13px;color:var(--text-3);line-height:1.6">
+                            支持上传任意类型文件（图片、音频、视频、文档等）。<br>
+                            单次最大 <strong id="maxUploadMb">100</strong> MB，个人总配额 <strong id="quotaMbLabel">-</strong> GB。<br>
+                            配额用满后无法继续上传，可联系管理员调整。
+                        </p>
+                    </div>
+                    <button class="btn-save" onclick="loadStorageInfo()">刷新用量</button>
                 </div>
             </div>
         </div>
